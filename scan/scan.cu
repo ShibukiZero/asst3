@@ -53,8 +53,48 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    cudaMemcpy(result, input, sizeof(int) * N, cudaMemcpyDeviceToDevice);
+    for (int two_d = 1; two_d <= N/2; two_d *= 2) {
+        int two_dplus1 = 2*two_d;
+        int numTasks = N / two_dplus1;
+
+        int blocks = (numTasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, numTasks);
+    }
+
+    result[N-1] = 0;
+
+    for (int two_d = N / 2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        int numTasks = N / two_dplus1;
+
+        int blocks = (numTasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        downsweep_kernel<<<blocks, THREADS_PER_BLOCKS>>>(result, two_d, numTasks);
+    }
 
 
+}
+
+__global__ void upsweep_kernel(int* data, int two_d, int numTasks) {
+    int Task = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = 2 * two_d;
+    int i = Task * two_dplus1;
+
+    if (Task < numTasks) {
+        data[i + two_dplus1 - 1] += data[i + two_d - 1];
+    }
+}
+
+__global__ void downsweep_kernel(int* data, int two_d, int numTasks) {
+    int Task = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = 2 * two_d;
+    int i = Task * two_dplus1;
+
+    if (Task < numTasks) {
+        int t = data[i+two_d-1];
+        data[i+two_d-1] = data[i+two_dplus1-1];
+        data[i+two_dplus1-1] += t;
+    }
 }
 
 
