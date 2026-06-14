@@ -1,11 +1,3 @@
-# Assignment 3: A Simple CUDA Renderer
-
-**Name(s):**
-**SUNet ID(s):**
-**Machine used for measurements:**
-
----
-
 ## Part 1: CUDA Warm-Up 1: SAXPY
 
 ### Q1
@@ -16,7 +8,43 @@ Assignment 1)?
 
 **Answer:**
 
+All numbers below were measured on the same AWS `g5g.xlarge` instance, which
+pairs an NVIDIA T4G GPU (40 SMs, ~15 GB, compute capability 7.5) with a 4-core
+AWS Graviton2 (Neoverse-N1) CPU. To keep the comparison on a single machine, I
+re-measured the Assignment 1 serial CPU saxpy here (single core, `N` = 20M,
+3 warmup iterations + min of 10 runs) rather than reusing the original laptop
+result. All bandwidths use the 3N convention (read `X`, read `Y`, write
+`result` = 3 floats per element) so the CPU and GPU figures are directly
+comparable; the GPU runs use the harness default of `N` = 100M, and saxpy
+bandwidth is size-independent at these sizes because the kernel is memory-bound.
 
+| Implementation | Hardware | Bandwidth (3N) |
+|---|---|---:|
+| Serial CPU saxpy (1 core) | Graviton2 | 23.8 GB/s |
+| CUDA saxpy, kernel only | T4G | ~230 GB/s |
+| CUDA saxpy, end-to-end (incl. PCIe transfer) | T4G | ~5.3 GB/s |
+
+Two observations:
+
+1. The GPU kernel alone is about **10x faster** than the serial CPU (230 vs
+   23.8 GB/s), reflecting the T4G's much wider GDDR6 memory system. saxpy is
+   purely memory-bound (2 flops per 12 bytes, arithmetic intensity
+   ~0.17 flop/byte), so this gap is essentially the ratio of sustainable memory
+   bandwidth between the two chips.
+
+2. However, once the cost of copying `X` and `Y` to the GPU and the result back
+   over PCIe is included, the effective throughput collapses to ~5.3 GB/s —
+   about **4.5x slower** than a single CPU core, and the gap would widen further
+   against a multi-threaded CPU version. Because saxpy does almost no arithmetic
+   per byte, the one-time PCIe transfer dominates end-to-end time and the GPU's
+   bandwidth advantage is entirely wasted. The CPU never pays this cost: its data
+   already lives in the memory it computes from.
+
+Conclusion: for an isolated, memory-bound saxpy, offloading to the GPU is a net
+loss end-to-end. The GPU only pays off when the data already resides in device
+memory (e.g., as one stage of a longer GPU pipeline, so the transfer is
+amortized) or when the kernel performs enough arithmetic per byte to hide the
+transfer cost.
 
 ---
 
@@ -33,7 +61,30 @@ bandwidth of an NVIDIA T4 GPU and the expected AWS memory bus bandwidth of
 
 **Answer:**
 
+The two timers measure very different things:
 
+- **Kernel-only timer** (~4.86 ms, ~230 GB/s) wraps just the kernel launch plus
+  `cudaDeviceSynchronize()`, so it measures GPU compute reading from and writing
+  to device memory. It is bounded by the T4G's on-board memory bandwidth.
+- **Whole-process timer** (~209 ms, ~5.3 GB/s) also includes the `cudaMemcpy` of
+  `X` and `Y` host->device and `result` device->host. It is bounded by the
+  host<->device PCIe link.
+
+The ~43x gap between them is the ratio of on-board memory bandwidth to PCIe
+bandwidth, and both numbers line up with the hardware:
+
+- The NVIDIA T4 has ~320 GB/s of memory bandwidth. The measured kernel bandwidth
+  of ~230 GB/s is about 72% of that, a reasonable sustained fraction for a simple
+  streaming kernel (peak is rarely reached in practice).
+- The effective bandwidth of ~5.3 GB/s matches the expected AWS host<->device bus
+  bandwidth of 5.3 GB/s almost exactly. This is well below a 16-lane PCIe 3.0
+  theoretical peak (~16 GB/s), because of chipset overheads and the use of
+  pageable (non-pinned) host memory, which forces an extra staging copy.
+
+So yes, both timers are consistent with the machine: the kernel timer reflects
+device memory bandwidth, while the whole-process timer reflects the much slower
+PCIe transfer, which dominates because the kernel itself is only ~5 ms of the
+~209 ms total.
 
 ---
 

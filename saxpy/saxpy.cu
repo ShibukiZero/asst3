@@ -67,36 +67,20 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     // of N that are not multiples of threadPerBlock.
     const int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
 
-    // These are pointers that will be pointers to memory allocated
-    // *one the GPU*.  You should allocate these pointers via
-    // cudaMalloc.  You can access the resulting buffers from CUDA
-    // device kernel code (see the kernel function saxpy_kernel()
-    // above) but you cannot access the contents these buffers from
-    // this thread. CPU threads cannot issue loads and stores from GPU
-    // memory!
+    // Pointers to buffers allocated on the GPU. CPU threads cannot
+    // load or store this memory directly; only device kernel code can.
     float* device_x = nullptr;
     float* device_y = nullptr;
     float* device_result = nullptr;
-    
-    //
-    // CS149 TODO: allocate device memory buffers on the GPU using cudaMalloc.
-    //
-    // We highly recommend taking a look at NVIDIA's
-    // tutorial, which clearly walks you through the few lines of code
-    // you need to write for this part of the assignment:
-    //
-    // https://devblogs.nvidia.com/easy-introduction-cuda-c-and-c/
-    //
-        
+
+    // allocate device buffers
     cudaCheckError(cudaMalloc((void**)&device_x, sizeof(float) * N));
     cudaCheckError(cudaMalloc((void**)&device_y, sizeof(float) * N));
     cudaCheckError(cudaMalloc((void**)&device_result, sizeof(float) * N));
     // start timing after allocation of device memory
     double startTime = CycleTimer::currentSeconds();
 
-    //
-    // CS149 TODO: copy input arrays to the GPU using cudaMemcpy
-    //
+    // copy input arrays from host to device
     cudaCheckError(cudaMemcpy(device_x, xarray, sizeof(float) * N, cudaMemcpyHostToDevice));
     cudaCheckError(cudaMemcpy(device_y, yarray, sizeof(float) * N, cudaMemcpyHostToDevice));
 
@@ -107,10 +91,8 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y, device_result);
     cudaCheckError(cudaDeviceSynchronize());
     double afterKernelTime = CycleTimer::currentSeconds();
-    //
-    // CS149 TODO: copy result from GPU back to CPU using cudaMemcpy
-    //
 
+    // copy result from device back to host
     cudaCheckError(cudaMemcpy(resultarray, device_result, sizeof(float) * N, cudaMemcpyDeviceToHost));
 
     // end timing after result has been copied back into host memory
@@ -128,9 +110,7 @@ void saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultar
     printf("Kernel BW by CUDA saxpy: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * kernelDuration, GBPerSec(totalBytes, kernelDuration));
     printf("Effective BW by CUDA saxpy: %.3f ms\t\t[%.3f GB/s]\n", 1000.f * overallDuration, GBPerSec(totalBytes, overallDuration));
 
-    //
-    // CS149 TODO: free memory buffers on the GPU using cudaFree
-    //
+    // free device buffers
     cudaCheckError(cudaFree(device_x));
     cudaCheckError(cudaFree(device_y));
     cudaCheckError(cudaFree(device_result));
