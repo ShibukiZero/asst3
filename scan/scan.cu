@@ -216,31 +216,37 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    if (length <= 1) {
+        return 0;
+    }
+
     int flag_length = length - 1;
+    int rounded_length = nextPow2(flag_length);
 
     int* flags;
     int* positions;
+    cudaMalloc((void**)&flags, sizeof(int) * rounded_length);
+    cudaMalloc((void**)&positions, sizeof(int) * rounded_length);
 
-    if (length <= 0) {
-        return;
-    }
+    int blocks = (flag_length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    make_flags_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, flag_length, flags);
 
-    int rounded_length = nextPow2(length);
+    exclusive_scan(flags, flag_length, positions);
 
-    cudaMalloc(&flags, sizeof(int) * rounded_N);
-    cudaMalloc(&positions, sizeof(int) * rounded_N);
+    scatter_repeats_kernel<<<blocks, THREADS_PER_BLOCK>>>(flags, positions, flag_length, device_output);
 
-    int blocks = (flag_length + THREADS_PER_BLOCKS - 1) / THREADS_PER_BLOCK;
-    make_flags_kernel<<<blocks, THREADS_PER_BLOCKS>>>(&device_input, flag_length, &flags);
+    int last_position;
+    int last_flag;
+    cudaMemcpy(&last_position, positions + flag_length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&last_flag, flags + flag_length - 1, sizeof(int), cudaMemcpyDeviceToHost);
 
-    exculusive_scan(&flags, flag_length, &positions);
+    cudaFree(flags);
+    cudaFree(positions);
 
-    scatter_out_kernel<<<blocks, THREADS_PER_BLOCKS>>>(&positions, flag_length, &device_output);
-
-    return 0; 
+    return last_position + last_flag;
 }
 
-__global__ make_flags_kernel(int* input, int length, int* flags) {
+__global__ void make_flags_kernel(int* input, int length, int* flags) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < length){
@@ -248,11 +254,11 @@ __global__ make_flags_kernel(int* input, int length, int* flags) {
     }
 }
 
-__global__ scatter_out_kernel(int* input, int length, int*positions) {
+__global__ void scatter_repeats_kernel(int* flags, int* positions, int length, int* output) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < length && flags[idx] == 1) {
-        device_output[positions[idx]] = idx;
+        output[positions[idx]] = idx;
     }
 }
 
