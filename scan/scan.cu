@@ -13,9 +13,11 @@
 #include "CycleTimer.h"
 
 #define THREADS_PER_BLOCK 256
+// Each block of THREADS_PER_BLOCK threads scans 2 elements per thread.
+#define ELEMENTS_PER_BLOCK (2 * THREADS_PER_BLOCK)
 
-__global__ void upsweep_kernel(int* data, int two_d, int numTasks);
-__global__ void downsweep_kernel(int* data, int two_d, int numTasks);
+__global__ void block_scan_kernel(int* data, int n, int* block_sums);
+__global__ void add_block_offsets_kernel(int* data, int n, int* block_offsets);
 __global__ void make_flags_kernel(int* input, int length, int* flags);
 __global__ void scatter_repeats_kernel(int* flags, int* positions, int length, int* output);
 
@@ -47,67 +49,107 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
+// Recursively exclusive-scans `n` elements of the device array `data` in place.
+// Phase 1 scans each ELEMENTS_PER_BLOCK-sized chunk locally in shared memory and
+// emits that chunk's total; phase 2 scans the chunk totals (recursing when there
+// is more than one chunk); phase 3 adds each chunk's offset back. Global-memory
+// traffic is only a couple of passes -- unlike the naive one-kernel-per-tree-level
+// version that streams the whole array through global memory ~2*log2(N) times.
+static void scan_in_place(int* data, int n) {
+    int num_blocks = (n + ELEMENTS_PER_BLOCK - 1) / ELEMENTS_PER_BLOCK;
+
+    int* block_sums = nullptr;
+    cudaMalloc((void**)&block_sums, sizeof(int) * num_blocks);
+
+    size_t shared_bytes = ELEMENTS_PER_BLOCK * sizeof(int);
+
+    // Phase 1: each block exclusive-scans its own chunk and writes the chunk
+    // total into block_sums.
+    block_scan_kernel<<<num_blocks, THREADS_PER_BLOCK, shared_bytes>>>(data, n, block_sums);
+
+    if (num_blocks > 1) {
+        // Phase 2: exclusive-scan the chunk totals so block_sums[i] becomes the
+        // offset that chunk i's elements need.
+        scan_in_place(block_sums, num_blocks);
+        // Phase 3: add each chunk's offset back into its elements.
+        add_block_offsets_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(data, n, block_sums);
+    }
+
+    cudaFree(block_sums);
+}
+
 void exclusive_scan(int* input, int N, int* result)
 {
-
-    // This runs on the CPU and drives the work-efficient parallel scan by
-    // launching one kernel per upsweep/downsweep level. Each level launches
-    // exactly one thread per active task (not one per element), so the total
-    // work stays O(N) rather than O(N log N).
     if (N <= 0) {
         return;
     }
 
-    int rounded_N = nextPow2(N);
-
-    // Scan runs in-place on `result`: seed it with the input, then zero-pad
-    // the tail out to the next power of two so the tree algorithm is exact.
+    // The scan runs in place on `result`; seed it with the input. No power-of-two
+    // padding is needed because the block scan bounds-checks its tail.
     cudaMemcpy(result, input, sizeof(int) * N, cudaMemcpyDeviceToDevice);
-    if (rounded_N > N) {
-        cudaMemset(result + N, 0, sizeof(int) * (rounded_N - N));
-    }
-
-    // Upsweep (reduce): each level sums pairs up the tree. At distance two_d
-    // there are rounded_N / (2*two_d) active tasks, so launch exactly that many.
-    for (int two_d = 1; two_d <= rounded_N / 2; two_d *= 2) {
-        int two_dplus1 = 2 * two_d;
-        int numTasks = rounded_N / two_dplus1;
-        int blocks = (numTasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, numTasks);
-    }
-
-    // Clear the root, then downsweep distributes the partial sums back down
-    // the tree to produce the exclusive prefix sums.
-    cudaMemset(result + rounded_N - 1, 0, sizeof(int));
-
-    for (int two_d = rounded_N / 2; two_d >= 1; two_d /= 2) {
-        int two_dplus1 = 2 * two_d;
-        int numTasks = rounded_N / two_dplus1;
-        int blocks = (numTasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, numTasks);
-    }
+    scan_in_place(result, N);
 }
 
-__global__ void upsweep_kernel(int* data, int two_d, int numTasks) {
-    int task = blockIdx.x * blockDim.x + threadIdx.x;
+// Work-efficient (Blelloch) exclusive scan of one chunk, done entirely in shared
+// memory. Each thread loads two elements; tail elements past `n` load 0. The
+// chunk's total sum is written to block_sums[blockIdx.x].
+__global__ void block_scan_kernel(int* data, int n, int* block_sums) {
+    extern __shared__ int temp[];
 
-    if (task < numTasks) {
-        int two_dplus1 = 2 * two_d;
-        int i = task * two_dplus1;
-        data[i + two_dplus1 - 1] += data[i + two_d - 1];
+    int tid = threadIdx.x;
+    int base = blockIdx.x * ELEMENTS_PER_BLOCK;
+    int ai = tid;
+    int bi = tid + THREADS_PER_BLOCK;   // second half of the chunk
+
+    temp[ai] = (base + ai < n) ? data[base + ai] : 0;
+    temp[bi] = (base + bi < n) ? data[base + bi] : 0;
+
+    int offset = 1;
+
+    // upsweep / reduce: build partial sums up the tree
+    for (int d = ELEMENTS_PER_BLOCK >> 1; d > 0; d >>= 1) {
+        __syncthreads();
+        if (tid < d) {
+            int x = offset * (2 * tid + 1) - 1;
+            int y = offset * (2 * tid + 2) - 1;
+            temp[y] += temp[x];
+        }
+        offset <<= 1;
     }
+
+    // stash the chunk total, then clear the root before the downsweep
+    if (tid == 0) {
+        block_sums[blockIdx.x] = temp[ELEMENTS_PER_BLOCK - 1];
+        temp[ELEMENTS_PER_BLOCK - 1] = 0;
+    }
+
+    // downsweep: distribute partial sums back down to exclusive prefix sums
+    for (int d = 1; d < ELEMENTS_PER_BLOCK; d <<= 1) {
+        offset >>= 1;
+        __syncthreads();
+        if (tid < d) {
+            int x = offset * (2 * tid + 1) - 1;
+            int y = offset * (2 * tid + 2) - 1;
+            int t = temp[x];
+            temp[x] = temp[y];
+            temp[y] += t;
+        }
+    }
+    __syncthreads();
+
+    if (base + ai < n) data[base + ai] = temp[ai];
+    if (base + bi < n) data[base + bi] = temp[bi];
 }
 
-__global__ void downsweep_kernel(int* data, int two_d, int numTasks) {
-    int task = blockIdx.x * blockDim.x + threadIdx.x;
+// Phase 3: add chunk i's scanned offset to every element of chunk i.
+__global__ void add_block_offsets_kernel(int* data, int n, int* block_offsets) {
+    int base = blockIdx.x * ELEMENTS_PER_BLOCK;
+    int add = block_offsets[blockIdx.x];
 
-    if (task < numTasks) {
-        int two_dplus1 = 2 * two_d;
-        int i = task * two_dplus1;
-        int t = data[i+two_d-1];
-        data[i+two_d-1] = data[i+two_dplus1-1];
-        data[i+two_dplus1-1] += t;
-    }
+    int ai = base + threadIdx.x;
+    int bi = base + threadIdx.x + THREADS_PER_BLOCK;
+    if (ai < n) data[ai] += add;
+    if (bi < n) data[bi] += add;
 }
 
 

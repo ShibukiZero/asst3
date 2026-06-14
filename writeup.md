@@ -97,23 +97,31 @@ downsweep parallel prefix-sum algorithm described in the handout.
 
 **Answer:**
 
-`exclusive_scan` runs on the host and drives the work-efficient scan by issuing
-one kernel launch per level of the upsweep and downsweep phases. The input is
-first copied into `result` and the tail is zero-padded up to the next power of
-two, so the binary-tree algorithm is exact. The upsweep (`upsweep_kernel`)
-reduces pairs up the tree; the root is then cleared and the downsweep
-(`downsweep_kernel`) distributes the partial sums back down to produce the
-exclusive prefix sums.
+`exclusive_scan` uses a **block-local shared-memory scan plus a recursive scan of
+the per-block totals**, rather than the naive one-kernel-per-tree-level approach.
+A naive version launches ~`2*log2(N)` kernels and streams the whole array through
+global memory once per level; for `N` = 40M that is ~50 global-memory passes and
+dominates runtime. The block-scan version touches global memory only a couple of
+times, which made it ~6x faster on this machine (and ~5.6x faster than the
+provided reference; see the comparison in Extra Credit Q1).
 
-The key performance decision is that each level launches **exactly one thread
-per active task, not one thread per element**. At distance `two_d` there are
-`rounded_N / (2 * two_d)` tasks, and each kernel computes its task index as
-`task = blockIdx.x * blockDim.x + threadIdx.x` and maps it directly to the array
-slot `task * two_dplus1`. This keeps total work at O(N) and avoids the naive
-pattern of launching N threads per level and masking off the inactive ones
-(which would be especially wasteful at the top of the tree, where only a handful
-of tasks remain). Successive kernel launches on the default stream are ordered,
-so no explicit synchronization is needed between levels.
+The host driver `scan_in_place(data, n)` runs three phases:
+
+1. **Block scan** (`block_scan_kernel`): the array is split into chunks of
+   `ELEMENTS_PER_BLOCK` = 512 elements (256 threads, 2 elements each). Each block
+   loads its chunk into shared memory and runs the work-efficient Blelloch
+   upsweep/downsweep entirely in shared memory, so the per-element tree traffic
+   never leaves the SM. Each block writes its chunk total into `block_sums`.
+2. **Scan the block totals**: `scan_in_place` recurses on `block_sums` so that
+   `block_sums[i]` becomes the exclusive offset that chunk `i` needs. For 40M
+   elements the recursion is only ~3 levels deep (40M -> ~78k -> ~153 -> 1).
+3. **Add offsets** (`add_block_offsets_kernel`): each block adds its scanned
+   offset to every element of its chunk, yielding the global exclusive scan.
+
+Boundary handling is done with bounds checks (tail elements past `n` load 0 and
+are not written back), so no power-of-two padding of the input is required.
+Kernel launches on the default stream are ordered, so no explicit host-side
+synchronization is needed between phases.
 
 ---
 
@@ -157,20 +165,20 @@ Measured on an AWS `g5g.xlarge` instance (NVIDIA T4G GPU, CUDA 12.8). Times in m
 
 | Test | Element Count | Ref Time | Student Time | Score |
 |---|---:|---:|---:|---:|
-| scan | 1000000 | 0.644 | 0.514 | 1.25 |
-| scan | 10000000 | 8.943 | 8.319 | 1.25 |
-| scan | 20000000 | 17.775 | 16.538 | 1.25 |
-| scan | 40000000 | 35.242 | 33.026 | 1.25 |
-| find_repeats | 1000000 | 1.028 | 0.814 | 1.25 |
-| find_repeats | 10000000 | 11.978 | 10.343 | 1.25 |
-| find_repeats | 20000000 | 21.458 | 19.330 | 1.25 |
-| find_repeats | 40000000 | 41.597 | 37.428 | 1.25 |
+| scan | 1000000 | 0.655 | 0.466 | 1.25 |
+| scan | 10000000 | 8.935 | 1.677 | 1.25 |
+| scan | 20000000 | 17.781 | 3.077 | 1.25 |
+| scan | 40000000 | 35.261 | 5.832 | 1.25 |
+| find_repeats | 1000000 | 1.062 | 0.786 | 1.25 |
+| find_repeats | 10000000 | 12.906 | 3.644 | 1.25 |
+| find_repeats | 20000000 | 21.551 | 5.827 | 1.25 |
+| find_repeats | 40000000 | 42.388 | 11.042 | 1.25 |
 
 Total scan score: 5.0 / 5.0
 Total find_repeats score: 5.0 / 5.0
 
-The student implementation is faster than the reference at every size, so all
-tests earn full marks.
+The block-scan implementation is several times faster than the reference at every
+size (e.g. ~6x at 40M for scan), so all tests earn full marks.
 
 ---
 
@@ -273,7 +281,35 @@ and compare against the Thrust implementation.
 
 **Answer:**
 
+The block-scan implementation described in Part 2 Q1 is the approach tuned for
+this. Going from the naive one-kernel-per-tree-level scan to the shared-memory
+block scan closed most of the gap to Thrust. Times below are `Student GPU time`
+vs `Thrust GPU time` on the same `g5g.xlarge` (random input, ms):
 
+| N | naive (old) | block-scan | Thrust | block-scan vs Thrust |
+|---:|---:|---:|---:|---:|
+| 1,000,000 | 0.516 | 0.465 | 0.343 | 1.4x |
+| 10,000,000 | 8.328 | 1.690 | 0.641 | 2.6x |
+| 20,000,000 | 16.589 | 3.069 | 0.984 | 3.1x |
+| 40,000,000 | 33.063 | 5.844 | 1.755 | 3.3x |
+
+The naive scan was ~18x slower than Thrust at 40M; the block scan is ~3.3x. The
+remaining gap comes from optimizations Thrust applies that this version does not:
+
+- **Shared-memory bank conflicts.** The Blelloch indexing `offset*(2*tid+k)-1`
+  makes many threads hit the same 32-bank set, especially at the deep tree
+  levels. A conflict-free padding (the classic `CONFLICT_FREE_OFFSET` macro)
+  would recover a meaningful fraction of this.
+- **Memory coalescing / work per thread.** Loading more elements per thread and
+  using vector (`int4`) loads improves global-memory throughput and reduces
+  launch count.
+- **Single-pass scan.** Modern Thrust uses a decoupled look-back scan that makes
+  essentially one pass over global memory, whereas the three-phase approach here
+  reads and writes the array a few times.
+
+So this is competitive in the sense of being within a small constant factor of a
+heavily optimized library (down from more than an order of magnitude), but not
+equal to it.
 
 ---
 
