@@ -16,12 +16,11 @@
 // Each block of THREADS_PER_BLOCK threads scans 2 elements per thread.
 #define ELEMENTS_PER_BLOCK (2 * THREADS_PER_BLOCK)
 
-// Shared-memory bank-conflict avoidance: the GPU has 32 shared-memory banks, so
-// the Blelloch tree indices (which stride by powers of two) repeatedly hit the
-// same bank. Padding each index by index/32 spreads them across banks.
+// Pad shared indices by index/32 to spread the Blelloch tree's power-of-two
+// strides across the GPU's 32 banks (avoids bank conflicts). SCAN_SMEM is the
+// resulting padded footprint for one chunk.
 #define LOG_NUM_BANKS 5
 #define CONFLICT_FREE_OFFSET(i) ((i) >> LOG_NUM_BANKS)
-// Padded shared-memory footprint for one chunk.
 #define SCAN_SMEM (ELEMENTS_PER_BLOCK + (ELEMENTS_PER_BLOCK >> LOG_NUM_BANKS))
 
 __global__ void block_scan_kernel(const int* in, int* out, int n, int* block_sums);
@@ -42,28 +41,11 @@ static inline int nextPow2(int n) {
     return n;
 }
 
-// exclusive_scan --
-//
-// Implementation of an exclusive scan on global memory array `input`,
-// with results placed in global memory `result`.
-//
-// N is the logical size of the input and output arrays, however
-// students can assume that both the start and result arrays we
-// allocated with next power-of-two sizes as described by the comments
-// in cudaScan().  This is helpful, since your parallel scan
-// will likely write to memory locations beyond N, but of course not
-// greater than N rounded up to the next power of 2.
-//
-// Also, as per the comments in cudaScan(), you can implement an
-// "in-place" scan, since the timing harness makes a copy of input and
-// places it in result
-// Exclusive-scans `n` elements from `in` into `out` (out-of-place at the top
-// level, which avoids an extra device-to-device copy of the whole array).
-// Phase 1 scans each ELEMENTS_PER_BLOCK-sized chunk locally in shared memory and
-// emits that chunk's total; phase 2 scans the chunk totals (recursing when there
-// is more than one chunk); phase 3 adds each chunk's offset back. Global-memory
-// traffic is only a couple of passes -- unlike the naive one-kernel-per-tree-level
-// version that streams the whole array through global memory ~2*log2(N) times.
+// Exclusive-scans `n` elements from `in` into `out` in three phases: each block
+// scans an ELEMENTS_PER_BLOCK chunk in shared memory and emits its total; the
+// chunk totals are scanned (recursively); each chunk's offset is added back.
+// Touches global memory only a few times, vs ~2*log2(N) passes for a naive
+// one-kernel-per-tree-level scan.
 static void scan_device(const int* in, int* out, int n) {
     int num_blocks = (n + ELEMENTS_PER_BLOCK - 1) / ELEMENTS_PER_BLOCK;
 
@@ -72,15 +54,13 @@ static void scan_device(const int* in, int* out, int n) {
 
     size_t shared_bytes = SCAN_SMEM * sizeof(int);
 
-    // Phase 1: each block exclusive-scans its own chunk (reading `in`, writing
-    // `out`) and writes the chunk total into block_sums.
+    // Phase 1: scan each chunk locally (in -> out), emit chunk totals.
     block_scan_kernel<<<num_blocks, THREADS_PER_BLOCK, shared_bytes>>>(in, out, n, block_sums);
 
     if (num_blocks > 1) {
-        // Phase 2: exclusive-scan the chunk totals in place so block_sums[i]
-        // becomes the offset that chunk i's elements need.
+        // Phase 2: scan the chunk totals so block_sums[i] becomes chunk i's offset.
         scan_device(block_sums, block_sums, num_blocks);
-        // Phase 3: add each chunk's offset back into its elements.
+        // Phase 3: add each chunk's offset back.
         add_block_offsets_kernel<<<num_blocks, THREADS_PER_BLOCK>>>(out, n, block_sums);
     }
 
@@ -92,16 +72,13 @@ void exclusive_scan(int* input, int N, int* result)
     if (N <= 0) {
         return;
     }
-
-    // No device-to-device copy and no power-of-two padding: the block scan reads
-    // `input` directly, writes `result`, and bounds-checks its tail.
+    // block scan reads `input` and writes `result` directly -- no copy, no padding.
     scan_device(input, result, N);
 }
 
-// Work-efficient (Blelloch) exclusive scan of one chunk, done entirely in shared
-// memory, reading from `in` and writing to `out`. Each thread loads two elements;
-// tail elements past `n` load 0. The chunk total is written to block_sums. Shared
-// indices are padded by CONFLICT_FREE_OFFSET to avoid bank conflicts.
+// Blelloch exclusive scan of one chunk in shared memory: read `in`, write `out`,
+// emit the chunk total to block_sums. Tail past `n` loads 0; shared indices use
+// CONFLICT_FREE_OFFSET padding.
 __global__ void block_scan_kernel(const int* in, int* out, int n, int* block_sums) {
     extern __shared__ int temp[];
 
