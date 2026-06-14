@@ -102,17 +102,19 @@ the per-block totals**, rather than the naive one-kernel-per-tree-level approach
 A naive version launches ~`2*log2(N)` kernels and streams the whole array through
 global memory once per level; for `N` = 40M that is ~50 global-memory passes and
 dominates runtime. The block-scan version touches global memory only a couple of
-times, which made it ~6x faster on this machine (and ~5.6x faster than the
-provided reference; see the comparison in Extra Credit Q1).
+times, which made it ~11.5x faster than the provided reference at 40M (see the
+profiling-backed comparison and the further tuning in Extra Credit Q1).
 
-The host driver `scan_in_place(data, n)` runs three phases:
+The host driver `scan_device(in, out, n)` runs three phases:
 
 1. **Block scan** (`block_scan_kernel`): the array is split into chunks of
    `ELEMENTS_PER_BLOCK` = 512 elements (256 threads, 2 elements each). Each block
-   loads its chunk into shared memory and runs the work-efficient Blelloch
-   upsweep/downsweep entirely in shared memory, so the per-element tree traffic
-   never leaves the SM. Each block writes its chunk total into `block_sums`.
-2. **Scan the block totals**: `scan_in_place` recurses on `block_sums` so that
+   loads its chunk of `in` into shared memory, runs the work-efficient Blelloch
+   upsweep/downsweep entirely in shared memory (with `CONFLICT_FREE_OFFSET`
+   padding to avoid bank conflicts), and writes the scanned chunk to `out` plus
+   its chunk total into `block_sums`. Reading `in` and writing `out` directly
+   avoids an extra device-to-device copy of the whole array.
+2. **Scan the block totals**: `scan_device` recurses on `block_sums` so that
    `block_sums[i]` becomes the exclusive offset that chunk `i` needs. For 40M
    elements the recursion is only ~3 levels deep (40M -> ~78k -> ~153 -> 1).
 3. **Add offsets** (`add_block_offsets_kernel`): each block adds its scanned
@@ -165,20 +167,20 @@ Measured on an AWS `g5g.xlarge` instance (NVIDIA T4G GPU, CUDA 12.8). Times in m
 
 | Test | Element Count | Ref Time | Student Time | Score |
 |---|---:|---:|---:|---:|
-| scan | 1000000 | 0.655 | 0.466 | 1.25 |
-| scan | 10000000 | 8.935 | 1.677 | 1.25 |
-| scan | 20000000 | 17.781 | 3.077 | 1.25 |
-| scan | 40000000 | 35.261 | 5.832 | 1.25 |
-| find_repeats | 1000000 | 1.062 | 0.786 | 1.25 |
-| find_repeats | 10000000 | 12.906 | 3.644 | 1.25 |
-| find_repeats | 20000000 | 21.551 | 5.827 | 1.25 |
-| find_repeats | 40000000 | 42.388 | 11.042 | 1.25 |
+| scan | 1000000 | 0.650 | 0.426 | 1.25 |
+| scan | 10000000 | 8.957 | 1.014 | 1.25 |
+| scan | 20000000 | 17.690 | 1.693 | 1.25 |
+| scan | 40000000 | 35.275 | 3.068 | 1.25 |
+| find_repeats | 1000000 | 1.053 | 0.722 | 1.25 |
+| find_repeats | 10000000 | 12.003 | 2.915 | 1.25 |
+| find_repeats | 20000000 | 21.444 | 4.385 | 1.25 |
+| find_repeats | 40000000 | 41.602 | 8.329 | 1.25 |
 
 Total scan score: 5.0 / 5.0
 Total find_repeats score: 5.0 / 5.0
 
-The block-scan implementation is several times faster than the reference at every
-size (e.g. ~6x at 40M for scan), so all tests earn full marks.
+The block-scan implementation is many times faster than the reference at every
+size (e.g. ~11.5x at 40M for scan), so all tests earn full marks.
 
 ---
 
@@ -281,35 +283,47 @@ and compare against the Thrust implementation.
 
 **Answer:**
 
-The block-scan implementation described in Part 2 Q1 is the approach tuned for
-this. Going from the naive one-kernel-per-tree-level scan to the shared-memory
-block scan closed most of the gap to Thrust. Times below are `Student GPU time`
-vs `Thrust GPU time` on the same `g5g.xlarge` (random input, ms):
+The scan was tuned in three iterations, each guided by profiling on the same
+`g5g.xlarge` (Nsight Systems for kernel counts, Nsight Compute for DRAM traffic).
+Times are `Student GPU time` vs `Thrust GPU time`, 40M random ints:
 
-| N | naive (old) | block-scan | Thrust | block-scan vs Thrust |
-|---:|---:|---:|---:|---:|
-| 1,000,000 | 0.516 | 0.465 | 0.343 | 1.4x |
-| 10,000,000 | 8.328 | 1.690 | 0.641 | 2.6x |
-| 20,000,000 | 16.589 | 3.069 | 0.984 | 3.1x |
-| 40,000,000 | 33.063 | 5.844 | 1.755 | 3.3x |
+| version | 40M time | vs Thrust |
+|---|---:|---:|
+| naive (one kernel per tree level) | 33.0 ms | 18.5x |
+| block scan (shared-memory, 3-phase) | 5.84 ms | 3.3x |
+| + drop redundant copy + conflict-free banks | 3.07 ms | **1.7x** |
+| Thrust (CUB single-pass look-back) | 1.81 ms | 1x |
 
-The naive scan was ~18x slower than Thrust at 40M; the block scan is ~3.3x. The
-remaining gap comes from optimizations Thrust applies that this version does not:
+**What profiling showed, and what each fix did.** Nsight Systems confirmed Thrust
+runs a single main `cub::DeviceScanKernel` using a `ScanTileState` -- i.e. the
+decoupled look-back single-pass scan -- versus my 5 kernels per scan. Nsight
+Compute then decomposed the (then 3.3x) time gap of the block-scan version into
+two independent factors that multiply almost exactly to the observed ratio:
 
-- **Shared-memory bank conflicts.** The Blelloch indexing `offset*(2*tid+k)-1`
-  makes many threads hit the same 32-bank set, especially at the deep tree
-  levels. A conflict-free padding (the classic `CONFLICT_FREE_OFFSET` macro)
-  would recover a meaningful fraction of this.
-- **Memory coalescing / work per thread.** Loading more elements per thread and
-  using vector (`int4`) loads improves global-memory throughput and reduces
-  launch count.
-- **Single-pass scan.** Modern Thrust uses a decoupled look-back scan that makes
-  essentially one pass over global memory, whereas the three-phase approach here
-  reads and writes the array a few times.
+- **Traffic 2.16x.** I moved 771 MB of DRAM vs Thrust's 357 MB (~1.1x the 2N
+  minimum). Thrust is genuinely single-pass; I was multi-pass.
+- **Achieved bandwidth 1.54x.** Thrust sustained 203 GB/s (63% of the T4G's
+  ~320 GB/s peak) vs my 132 GB/s (41%). The peak is fixed; the *achieved*
+  fraction is not -- my kernel stalls global memory during the in-shared-memory
+  tree phase and runs only 2 elements/thread, so it keeps the bus less busy.
 
-So this is competitive in the sense of being within a small constant factor of a
-heavily optimized library (down from more than an order of magnitude), but not
-equal to it.
+Two of those findings became fixes (the third iteration above): (1) the original
+code did a device-to-device `cudaMemcpy` of the whole array before scanning --
+2N of pure waste inside the timed region -- which I removed by reading the input
+and writing the result directly; (2) adding `CONFLICT_FREE_OFFSET` padding to the
+Blelloch shared-memory indices removed bank conflicts and lifted achieved
+bandwidth. Together these roughly halved the time (5.84 -> 3.07 ms) and closed the
+gap to 1.7x, still at full marks on the checker.
+
+**Why I stopped at 1.7x.** Closing the rest means matching Thrust's traffic (2N),
+which requires the decoupled look-back single-pass algorithm: a global per-tile
+state array, cross-block publish/look-back with memory fences and atomic status
+flags, and careful forward-progress guarantees to avoid deadlock. That is the
+core of CUB; its difficulty is concurrency correctness (nondeterministic, load-
+dependent bugs), not line count, and the payoff here is only the last ~1.7x on a
+warm-up part that is already full marks. So this implementation is competitive
+(within a small constant factor of a heavily optimized library, down from more
+than an order of magnitude) rather than equal.
 
 ---
 
