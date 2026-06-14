@@ -67,6 +67,21 @@ static void scan_device(const int* in, int* out, int n) {
     cudaFree(block_sums);
 }
 
+// exclusive_scan --
+//
+// Implementation of an exclusive scan on global memory array `input`,
+// with results placed in global memory `result`.
+//
+// N is the logical size of the input and output arrays, however
+// students can assume that both the start and result arrays we
+// allocated with next power-of-two sizes as described by the comments
+// in cudaScan().  This is helpful, since your parallel scan
+// will likely write to memory locations beyond N, but of course not
+// greater than N rounded up to the next power of 2.
+//
+// Also, as per the comments in cudaScan(), you can implement an
+// "in-place" scan, since the timing harness makes a copy of input and
+// places it in result
 void exclusive_scan(int* input, int N, int* result)
 {
     if (N <= 0) {
