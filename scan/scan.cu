@@ -14,6 +14,11 @@
 
 #define THREADS_PER_BLOCK 256
 
+__global__ void upsweep_kernel(int* data, int two_d, int numTasks);
+__global__ void downsweep_kernel(int* data, int two_d, int numTasks);
+__global__ void make_flags_kernel(int* input, int length, int* flags);
+__global__ void scatter_repeats_kernel(int* flags, int* positions, int length, int* output);
+
 
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
@@ -53,44 +58,55 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    if (N <= 0) {
+        return;
+    }
+
+    int rounded_N = nextPow2(N);
+
     cudaMemcpy(result, input, sizeof(int) * N, cudaMemcpyDeviceToDevice);
-    for (int two_d = 1; two_d <= N/2; two_d *= 2) {
+
+    if (rounded_N > N) {
+        cudaMemset(result + N, 0, sizeof(int) * (rounded_N - N));
+    }
+
+    for (int two_d = 1; two_d <= rounded_N / 2; two_d *= 2) {
         int two_dplus1 = 2*two_d;
-        int numTasks = N / two_dplus1;
+        int numTasks = rounded_N / two_dplus1;
 
         int blocks = (numTasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, numTasks);
     }
 
-    result[N-1] = 0;
+    cudaMemset(result + rounded_N - 1, 0, sizeof(int));
 
-    for (int two_d = N / 2; two_d >= 1; two_d /= 2) {
+    for (int two_d = rounded_N / 2; two_d >= 1; two_d /= 2) {
         int two_dplus1 = 2*two_d;
-        int numTasks = N / two_dplus1;
+        int numTasks = rounded_N / two_dplus1;
 
         int blocks = (numTasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        downsweep_kernel<<<blocks, THREADS_PER_BLOCKS>>>(result, two_d, numTasks);
+        downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, numTasks);
     }
 
 
 }
 
 __global__ void upsweep_kernel(int* data, int two_d, int numTasks) {
-    int Task = blockIdx.x * blockDim.x + threadIdx.x;
-    int two_dplus1 = 2 * two_d;
-    int i = Task * two_dplus1;
+    int task = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (Task < numTasks) {
+    if (task < numTasks) {
+        int two_dplus1 = 2 * two_d;
+        int i = task * two_dplus1;
         data[i + two_dplus1 - 1] += data[i + two_d - 1];
     }
 }
 
 __global__ void downsweep_kernel(int* data, int two_d, int numTasks) {
-    int Task = blockIdx.x * blockDim.x + threadIdx.x;
-    int two_dplus1 = 2 * two_d;
-    int i = Task * two_dplus1;
+    int task = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (Task < numTasks) {
+    if (task < numTasks) {
+        int two_dplus1 = 2 * two_d;
+        int i = task * two_dplus1;
         int t = data[i+two_d-1];
         data[i+two_d-1] = data[i+two_dplus1-1];
         data[i+two_dplus1-1] += t;
@@ -200,8 +216,44 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    int flag_length = length - 1;
+
+    int* flags;
+    int* positions;
+
+    if (length <= 0) {
+        return;
+    }
+
+    int rounded_length = nextPow2(length);
+
+    cudaMalloc(&flags, sizeof(int) * rounded_N);
+    cudaMalloc(&positions, sizeof(int) * rounded_N);
+
+    int blocks = (flag_length + THREADS_PER_BLOCKS - 1) / THREADS_PER_BLOCK;
+    make_flags_kernel<<<blocks, THREADS_PER_BLOCKS>>>(&device_input, flag_length, &flags);
+
+    exculusive_scan(&flags, flag_length, &positions);
+
+    scatter_out_kernel<<<blocks, THREADS_PER_BLOCKS>>>(&positions, flag_length, &device_output);
 
     return 0; 
+}
+
+__global__ make_flags_kernel(int* input, int length, int* flags) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < length){
+        flags[idx] = (input[idx] == input[idx + 1]) ? 1 : 0;
+    }
+}
+
+__global__ scatter_out_kernel(int* input, int length, int*positions) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < length && flags[idx] == 1) {
+        device_output[positions[idx]] = idx;
+    }
 }
 
 
