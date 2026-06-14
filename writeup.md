@@ -97,7 +97,23 @@ downsweep parallel prefix-sum algorithm described in the handout.
 
 **Answer:**
 
+`exclusive_scan` runs on the host and drives the work-efficient scan by issuing
+one kernel launch per level of the upsweep and downsweep phases. The input is
+first copied into `result` and the tail is zero-padded up to the next power of
+two, so the binary-tree algorithm is exact. The upsweep (`upsweep_kernel`)
+reduces pairs up the tree; the root is then cleared and the downsweep
+(`downsweep_kernel`) distributes the partial sums back down to produce the
+exclusive prefix sums.
 
+The key performance decision is that each level launches **exactly one thread
+per active task, not one thread per element**. At distance `two_d` there are
+`rounded_N / (2 * two_d)` tasks, and each kernel computes its task index as
+`task = blockIdx.x * blockDim.x + threadIdx.x` and maps it directly to the array
+slot `task * two_dplus1`. This keeps total work at O(N) and avoids the naive
+pattern of launching N threads per level and masking off the inactive ones
+(which would be especially wasteful at the top of the tree, where only a handful
+of tasks remain). Successive kernel launches on the default stream are ordered,
+so no explicit synchronization is needed between levels.
 
 ---
 
@@ -109,7 +125,20 @@ should use one or more calls to `exclusive_scan`.
 
 **Answer:**
 
+`find_repeats` uses the standard flag -> scan -> scatter pattern:
 
+1. `make_flags_kernel` builds a 0/1 array of length `N-1` where `flag[i] = 1`
+   iff `input[i] == input[i+1]`.
+2. `exclusive_scan` over the flags yields `positions[i]` = the number of matches
+   strictly before `i`, i.e. the output slot that match `i` should be written to.
+3. `scatter_repeats_kernel` lets each thread whose flag is set write its index
+   `i` into `output[positions[i]]`. Because the exclusive scan assigns each match
+   a distinct, monotonically increasing slot, the writes never collide and the
+   output stays in sorted index order.
+
+The number of matches is recovered as `positions[N-2] + flags[N-2]` (the
+exclusive-scan total). `exclusive_scan` does not modify `flags`, so the flag
+array can be reused both for the scatter and for this final count.
 
 ---
 
@@ -124,19 +153,24 @@ Report the correctness and performance results from:
 
 **Answer:**
 
+Measured on an AWS `g5g.xlarge` instance (NVIDIA T4G GPU, CUDA 12.8). Times in ms.
+
 | Test | Element Count | Ref Time | Student Time | Score |
 |---|---:|---:|---:|---:|
-| scan |  |  |  |  |
-| scan |  |  |  |  |
-| scan |  |  |  |  |
-| scan |  |  |  |  |
-| find_repeats |  |  |  |  |
-| find_repeats |  |  |  |  |
-| find_repeats |  |  |  |  |
-| find_repeats |  |  |  |  |
+| scan | 1000000 | 0.644 | 0.514 | 1.25 |
+| scan | 10000000 | 8.943 | 8.319 | 1.25 |
+| scan | 20000000 | 17.775 | 16.538 | 1.25 |
+| scan | 40000000 | 35.242 | 33.026 | 1.25 |
+| find_repeats | 1000000 | 1.028 | 0.814 | 1.25 |
+| find_repeats | 10000000 | 11.978 | 10.343 | 1.25 |
+| find_repeats | 20000000 | 21.458 | 19.330 | 1.25 |
+| find_repeats | 40000000 | 41.597 | 37.428 | 1.25 |
 
-Total scan score:
-Total find_repeats score:
+Total scan score: 5.0 / 5.0
+Total find_repeats score: 5.0 / 5.0
+
+The student implementation is faster than the reference at every size, so all
+tests earn full marks.
 
 ---
 

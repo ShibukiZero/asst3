@@ -50,45 +50,42 @@ static inline int nextPow2(int n) {
 void exclusive_scan(int* input, int N, int* result)
 {
 
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
+    // This runs on the CPU and drives the work-efficient parallel scan by
+    // launching one kernel per upsweep/downsweep level. Each level launches
+    // exactly one thread per active task (not one per element), so the total
+    // work stays O(N) rather than O(N log N).
     if (N <= 0) {
         return;
     }
 
     int rounded_N = nextPow2(N);
 
+    // Scan runs in-place on `result`: seed it with the input, then zero-pad
+    // the tail out to the next power of two so the tree algorithm is exact.
     cudaMemcpy(result, input, sizeof(int) * N, cudaMemcpyDeviceToDevice);
-
     if (rounded_N > N) {
         cudaMemset(result + N, 0, sizeof(int) * (rounded_N - N));
     }
 
+    // Upsweep (reduce): each level sums pairs up the tree. At distance two_d
+    // there are rounded_N / (2*two_d) active tasks, so launch exactly that many.
     for (int two_d = 1; two_d <= rounded_N / 2; two_d *= 2) {
-        int two_dplus1 = 2*two_d;
+        int two_dplus1 = 2 * two_d;
         int numTasks = rounded_N / two_dplus1;
-
         int blocks = (numTasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, numTasks);
     }
 
+    // Clear the root, then downsweep distributes the partial sums back down
+    // the tree to produce the exclusive prefix sums.
     cudaMemset(result + rounded_N - 1, 0, sizeof(int));
 
     for (int two_d = rounded_N / 2; two_d >= 1; two_d /= 2) {
-        int two_dplus1 = 2*two_d;
+        int two_dplus1 = 2 * two_d;
         int numTasks = rounded_N / two_dplus1;
-
         int blocks = (numTasks + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, numTasks);
     }
-
-
 }
 
 __global__ void upsweep_kernel(int* data, int two_d, int numTasks) {
@@ -205,17 +202,10 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 // Returns the total number of pairs found
 int find_repeats(int* device_input, int length, int* device_output) {
 
-    // CS149 TODO:
-    //
-    // Implement this function. You will probably want to
-    // make use of one or more calls to exclusive_scan(), as well as
-    // additional CUDA kernel launches.
-    //    
-    // Note: As in the scan code, the calling code ensures that
-    // allocated arrays are a power of 2 in size, so you can use your
-    // exclusive_scan function with them. However, your implementation
-    // must ensure that the results of find_repeats are correct given
-    // the actual array length.
+    // Strategy: build a 0/1 flag array where flag[i] = 1 iff input[i] ==
+    // input[i+1], exclusive-scan it to get the output slot of each match, then
+    // scatter the matching indices into those slots. The match count is the
+    // scan's last element plus the last flag.
     if (length <= 1) {
         return 0;
     }
@@ -229,12 +219,17 @@ int find_repeats(int* device_input, int length, int* device_output) {
     cudaMalloc((void**)&positions, sizeof(int) * rounded_length);
 
     int blocks = (flag_length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+    // flags[i] = 1 if input[i] == input[i+1], else 0
     make_flags_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, flag_length, flags);
 
+    // positions[i] = number of matches strictly before i = output slot for match i
     exclusive_scan(flags, flag_length, positions);
 
+    // write each matching index i into output[positions[i]]
     scatter_repeats_kernel<<<blocks, THREADS_PER_BLOCK>>>(flags, positions, flag_length, device_output);
 
+    // total matches = exclusive-scan total = positions[last] + flags[last]
     int last_position;
     int last_flag;
     cudaMemcpy(&last_position, positions + flag_length - 1, sizeof(int), cudaMemcpyDeviceToHost);
