@@ -490,17 +490,6 @@ Compute counters, and the tile size was chosen by an empirical sweep, not a hunc
 
 ---
 
-### Q3
-
-If you implemented a high-quality parallel CPU-only renderer, describe the
-implementation, performance, and how it compares with your GPU solution.
-
-**Answer:**
-
-
-
----
-
 ## Submission Checklist
 
 - [ ] `writeup.pdf` generated from this writeup.
