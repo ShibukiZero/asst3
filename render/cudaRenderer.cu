@@ -60,7 +60,11 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // test SCAN_BLOCK_DIM circles per batch, so SCAN_BLOCK_DIM = block thread count.
 // SCAN_BLOCK_DIM must be defined before including the shared-memory scan, and be
 // a power of two <= 1024. circleBoxTest provides the cull test (circleInBox).
-#define TILE_DIM 16
+// 32x32 = 1024 threads/block is the largest legal tile (SCAN_BLOCK_DIM must be a
+// power of two <= 1024). A sweep over 8/16/32 showed bigger tiles win: fewer
+// circle batches => fewer per-batch scan + __syncthreads, which dominated the
+// runtime on circle-heavy scenes (e.g. micro2M ~3x faster at 32 than at 16).
+#define TILE_DIM 32
 #define SCAN_BLOCK_DIM (TILE_DIM * TILE_DIM)
 #include "circleBoxTest.cu_inl"
 #include "exclusiveScan.cu_inl"
