@@ -199,20 +199,27 @@ Run the checker from the `render` directory:
 
 **Answer:**
 
-Machine:
+Machine: AWS `g5g.xlarge` (NVIDIA T4G GPU, compute capability 7.5, 40 SMs,
+~15 GB, CUDA 12.8). Times in ms.
 
 | Scene Name | Ref Time (T_ref) | Your Time (T) | Score |
 |---|---:|---:|---:|
-| rgb |  |  |  |
-| rand10k |  |  |  |
-| rand100k |  |  |  |
-| pattern |  |  |  |
-| snowsingle |  |  |  |
-| biglittle |  |  |  |
-| rand1M |  |  |  |
-| micro2M |  |  |  |
+| rgb | 0.2624 | 0.2627 | 9 |
+| rand10k | 3.0574 | 1.9167 | 9 |
+| rand100k | 29.7249 | 17.7517 | 9 |
+| pattern | 0.4097 | 0.3006 | 9 |
+| snowsingle | 19.7341 | 6.5476 | 9 |
+| biglittle | 15.3124 | 15.0094 | 9 |
+| rand1M | 241.9320 | 84.4519 | 9 |
+| micro2M | 471.6679 | 145.0002 | 9 |
 
-Total render score:
+Total render score: 72 / 72
+
+The solution is faster than the reference on every scene except the two that are
+already at a floor (rgb is bound by the unavoidable image read/write; biglittle
+is throughput-bound on a few huge circles). On the circle-heavy scenes it is
+significantly faster than the reference (e.g. snowsingle ~3.0x, micro2M ~3.3x,
+rand1M ~2.9x).
 
 ---
 
@@ -223,7 +230,34 @@ CUDA thread blocks and threads, and maybe warps.
 
 **Answer:**
 
+The decomposition is **by pixels (tiles), not by circles**. The starter kernel
+parallelized over circles (one thread per circle), which is what forces the
+non-atomic, out-of-order image updates. Instead, the screen is partitioned into
+`TILE_DIM x TILE_DIM` = 32x32 pixel tiles, and:
 
+- **one thread block per tile**, and
+- **one thread per pixel** within the tile (1024 threads = 32x32).
+
+Each thread block has a **dual role** over the same 1024 threads:
+
+- During *culling*, the threads act as **circle testers**: the block walks the
+  circle array in batches of `SCAN_BLOCK_DIM` = 1024, and in each batch thread
+  `i` tests circle `(batchStart + i)` against the tile's bounding box with
+  `circleInBox`, producing a 0/1 hit flag.
+- During *shading*, the same threads act as **pixels**: thread `i` owns one pixel
+  and blends circles into a private `float4` register accumulator.
+
+For each batch, the hit flags are compacted into an ordered, dense list of
+circle indices using the shared-memory exclusive scan (`exclusiveScan.cu_inl`):
+the scan turns the flag array into per-thread output slots, and each hitting
+thread scatters its circle index into the shared `hitList`. Every pixel then
+loops over just that batch's hit list (the circles that actually touch the tile),
+in index order, instead of over all N circles. This is what cuts the per-pixel
+work from O(N) to O(circles touching the tile).
+
+The natural unit is the block/tile; warps matter only in that the scan requires
+a warp-sorted linear thread index (`threadIdx.y * blockDim.x + threadIdx.x`), so
+that 32 consecutive linear indices form a warp.
 
 ---
 
@@ -233,7 +267,23 @@ Describe where synchronization occurs in your solution.
 
 **Answer:**
 
+All synchronization is **intra-block** (`__syncthreads()`); there is no
+cross-block synchronization and no atomics. Each circle batch has four barriers,
+because the cull / scan / scatter / shade steps share the same shared-memory
+buffers and each step depends on all threads finishing the previous one:
 
+1. After every thread writes its hit flag, before the scan reads the flag array.
+2. After the scan, before reading the offsets — the provided `sharedMemExclusiveScan`
+   has internal barriers but **no trailing barrier** after it writes its output,
+   so one is needed before any thread reads another thread's offset (and the
+   batch hit count at the last index).
+3. After the scatter into `hitList`, before the pixels read it for shading.
+4. After shading, before the next batch overwrites the shared buffers.
+
+These barriers are correct because the loop bound (`numCircles`) is uniform
+across the block, so every thread runs the same number of batches and reaches
+every barrier together. The number of barriers (4 per batch) is also why tile
+size matters for performance — see Q4/Q5.
 
 ---
 
@@ -244,7 +294,33 @@ synchronization or main memory bandwidth requirements?
 
 **Answer:**
 
+- **Register accumulator, one image write per pixel.** The starter `shadePixel`
+  did a global read-modify-write of the image for every (circle, pixel)
+  contribution. Each thread instead accumulates its pixel into a `float4` held in
+  registers and writes it to global memory exactly once at the end. This removes
+  almost all of the image-memory traffic and is also what makes the update atomic
+  (Q6).
 
+- **Culling removes redundant work, which was the real bottleneck.** Profiling
+  the naive pixel-parallel version with Nsight Compute showed it was *not*
+  DRAM-bound (DRAM throughput < 0.15% on every circle-heavy scene) but
+  compute/L1-bound: the circle data stays in cache, so the cost was the sheer
+  number of (pixel, circle) iterations. Building a per-tile hit list cuts those
+  iterations from O(pixels x N) to roughly O(pixels x circles-per-tile), directly
+  attacking that bottleneck. The hit list lives in shared memory, so the
+  shade-phase reads of circle indices never go to global memory.
+
+- **Tile size chosen to minimize synchronization overhead.** Each batch costs a
+  shared-memory scan plus four `__syncthreads()`, and the number of batches is
+  `N / SCAN_BLOCK_DIM`. Using the largest legal tile (32x32 -> batch of 1024)
+  minimizes the batch count and therefore the total scan + barrier overhead;
+  profiling the 16x16 version showed it was partly stalled (no pipe saturated) on
+  exactly this overhead.
+
+I deliberately did **not** cache circle position/radius/color in shared memory
+for the shade phase. It was an option (it would relieve L1, which is co-saturated),
+but it costs shared memory and occupancy, and the profiling showed culling alone
+already reached and exceeded the reference, so the extra trade was unnecessary.
 
 ---
 
@@ -256,7 +332,40 @@ measurements you performed to guide optimization.
 
 **Answer:**
 
+The solution was reached in three measured steps:
 
+1. **Correct, naive pixel-parallel baseline.** First I flipped the axis from
+   circles to pixels: one thread per pixel, each looping over all circles in
+   order and accumulating in a register. This is trivially correct (Q6) and
+   scored 26/72 — full marks on tiny scenes (rgb) but failing the performance
+   bar on circle-heavy scenes because its work is O(pixels x circles).
+
+2. **Profile to find the real bottleneck.** Using Nsight Systems I confirmed the
+   render kernel dominated runtime; using Nsight Compute (SpeedOfLight) on all
+   eight scenes I found the bottleneck was compute + L1, *not* DRAM (DRAM
+   throughput was ~0.02-0.13%). This corrected my initial assumption that it
+   would be memory-bound from re-reading circle data: the circle arrays stay in
+   cache (all warps march through the array together), so the cost is the number
+   of iterations, not memory bandwidth. The fix therefore had to *reduce
+   iterations*, which is exactly what tiling + culling does — not caching.
+
+3. **Tiled culling, then a tile-size sweep.** I added the per-tile cull / scan /
+   scatter / shade kernel, which reached 72/72. Re-profiling the 16x16 version
+   showed it was no longer saturating any pipe on sparse scenes (compute ~67-71%,
+   L1 ~74-76%), with the stalls pointing at per-batch overhead (the scan + 4
+   barriers, run `N/256` times; micro2M has ~7800 batches). Hypothesis: a larger
+   tile means a larger batch, fewer batches, and less fixed overhead. A sweep
+   over 8/16/32 confirmed it monotonically — 8x8 was much slower (4-5/9 on many
+   scenes), 32x32 much faster — so I set the tile to 32x32 (the largest legal
+   size, since the scan caps at 1024 threads). This gave ~3x speedups on the
+   circle-heavy scenes (micro2M 502 -> 145 ms) and put the renderer well past the
+   reference.
+
+Approaches considered and rejected: a per-circle approach with atomic/locked
+image updates (fails the ordering requirement and contends badly); a dense
+length-N flag array per tile instead of a compacted list (avoids write conflicts
+but keeps the per-pixel loop at O(N) and does not fit in shared memory at scale);
+and shared-memory caching of circle data (a real but unnecessary trade, see Q4).
 
 ---
 
@@ -270,7 +379,28 @@ handout:
 
 **Answer:**
 
+Both invariants are satisfied **structurally, with no locks or atomics**, because
+each pixel is owned by exactly one thread.
 
+- **Atomicity.** A pixel's color is only ever read, blended, and written by its
+  single owning thread, in a private `float4` register accumulator. No other
+  thread touches that pixel, so there is no shared read-modify-write to make
+  atomic in the first place — the critical region the starter code worried about
+  simply does not exist. The pixel is written to global memory once, at the end.
+
+- **Order.** The owning thread blends circles in strictly increasing circle
+  index. Within a batch, the exclusive scan compacts hits in linear-thread-index
+  order, and thread `i` corresponds to circle `batchStart + i`, so `hitList` is
+  in ascending index order. Batches are processed in ascending order, and the
+  register accumulator carries across batches. Therefore every pixel applies its
+  contributions in exactly circle-input order, matching the sequential reference.
+
+The handout notes that order only matters for circles touching the *same* pixel;
+circles touching different pixels are independent. Owning each pixel by one
+thread makes both the "same pixel" ordering and the atomicity automatic, which is
+why no synchronization between threads is needed for correctness of the blend
+itself (the `__syncthreads()` in Q3 only coordinate the shared-memory hit-list
+construction, not the image updates).
 
 ---
 
@@ -334,7 +464,29 @@ explain the approach thoroughly.
 
 **Answer:**
 
+The renderer is faster than the reference on every circle-heavy scene, by a wide
+margin on several: snowsingle ~3.0x, micro2M ~3.3x, rand1M ~2.9x, rand100k ~1.7x,
+rand10k ~1.6x, pattern ~1.4x (rgb and biglittle are at their respective floors).
 
+Two design choices account for this, both validated by profiling (full detail in
+Part 3 Q4/Q5):
+
+1. **Tiling + per-tile culling** turns the per-pixel cost from O(N) circles into
+   O(circles touching the tile). Nsight Compute confirmed the bottleneck was
+   compute/L1 (iteration count), not DRAM, so cutting iterations is exactly the
+   right lever; this alone reached parity with the reference.
+
+2. **Largest legal tile (32x32 = 1024 threads).** The per-batch overhead (one
+   shared-memory scan + four `__syncthreads()`) is paid `N / SCAN_BLOCK_DIM`
+   times. Re-profiling the 16x16 version showed it was stalled on this overhead
+   (no pipe saturated on sparse scenes). A monotonic sweep over 8/16/32 confirmed
+   bigger is better; 32x32 minimizes the batch count and gave the ~3x speedups
+   above (e.g. micro2M 502 -> 145 ms). 32 is the maximum because the shared-memory
+   scan caps at 1024 threads.
+
+The key methodological point is that none of this was guessed: the optimization
+target (reduce iterations, then reduce batch overhead) was read off Nsight
+Compute counters, and the tile size was chosen by an empirical sweep, not a hunch.
 
 ---
 
