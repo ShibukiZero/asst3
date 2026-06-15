@@ -56,6 +56,15 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
 
+// TILE_DIM x TILE_DIM pixels per tile = one thread block; the same threads also
+// test SCAN_BLOCK_DIM circles per batch, so SCAN_BLOCK_DIM = block thread count.
+// SCAN_BLOCK_DIM must be defined before including the shared-memory scan, and be
+// a power of two <= 1024. circleBoxTest provides the cull test (circleInBox).
+#define TILE_DIM 16
+#define SCAN_BLOCK_DIM (TILE_DIM * TILE_DIM)
+#include "circleBoxTest.cu_inl"
+#include "exclusiveScan.cu_inl"
+
 
 // kernelClearImageSnowflake -- (CUDA device code)
 //
@@ -372,43 +381,92 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4& color) {
     color.w = alpha + color.w;
 }
 
-// kernelRenderPixels -- (CUDA device code)
+// kernelRenderTiles -- (CUDA device code)
 //
-// Pixel-parallel renderer: one CUDA thread per pixel. Each thread walks every
-// circle in input order, blends the circles that cover its pixel center into a
-// register accumulator, and writes the final color once. Because each pixel is
-// owned by exactly one thread, the two correctness requirements -- ordered
-// updates and atomic updates -- hold for free, with no locks or atomics.
-//
-// This is the correct-but-naive baseline: its work is O(pixels * circles), so
-// it is fast on small scenes but slow on the large ones. The tiled version
-// reduces that by culling circles per screen region and reusing circle data
-// from shared memory.
-__global__ void kernelRenderPixels() {
+// Tile-parallel renderer. One thread block per TILE_DIM x TILE_DIM tile of
+// pixels, one thread per pixel. Instead of every pixel testing every circle,
+// the block cooperatively culls circles against the tile, in batches:
+//   1. each of the 256 threads tests one circle -> hit flag
+//   2. an exclusive scan of the flags gives each hit a slot in a compact list
+//   3. hits are scattered into that shared-memory list, in circle-index order
+//   4. each pixel blends only this batch's hit list, in order, into a register
+// Ordering and atomicity still hold for free: each pixel is owned by one thread
+// and visits circles in input order. Culling cuts per-pixel work from O(N) to
+// O(circles that actually touch this tile).
+__global__ void kernelRenderTiles() {
 
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
-
-    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageWidth  = cuConstRendererParams.imageWidth;
     int imageHeight = cuConstRendererParams.imageHeight;
-    if (pixelX >= imageWidth || pixelY >= imageHeight)
-        return;
-
-    float invWidth = 1.f / imageWidth;
+    float invWidth  = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
-    float2 pixelCenter = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                     invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-    float4 color = *imgPtr;   // start from the cleared background color
+    // This thread's pixel, plus a warp-sorted linear thread index for the scan.
+    int pixelX = blockIdx.x * TILE_DIM + threadIdx.x;
+    int pixelY = blockIdx.y * TILE_DIM + threadIdx.y;
+    int linearIdx = threadIdx.y * TILE_DIM + threadIdx.x;
 
-    int numCircles = cuConstRendererParams.numCircles;
-    for (int i = 0; i < numCircles; i++) {
-        float3 p = *(float3*)(&cuConstRendererParams.position[3 * i]);
-        shadePixel(i, pixelCenter, p, color);
+    // This tile's box in normalized [0,1] coords (boxT >= boxB, boxR >= boxL).
+    float boxL = (blockIdx.x * TILE_DIM) * invWidth;
+    float boxR = min((int)((blockIdx.x + 1) * TILE_DIM), imageWidth)  * invWidth;
+    float boxB = (blockIdx.y * TILE_DIM) * invHeight;
+    float boxT = min((int)((blockIdx.y + 1) * TILE_DIM), imageHeight) * invHeight;
+
+    // This pixel's center and its register colour accumulator.
+    bool validPixel = (pixelX < imageWidth) && (pixelY < imageHeight);
+    float2 pixelCenter = make_float2(invWidth * (pixelX + 0.5f), invHeight * (pixelY + 0.5f));
+    float4 color = make_float4(0.f, 0.f, 0.f, 0.f);
+    float4* imgPtr = NULL;
+    if (validPixel) {
+        imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+        color = *imgPtr;   // start from the cleared background
     }
 
-    *imgPtr = color;   // single write per pixel
+    // Shared memory for one batch of SCAN_BLOCK_DIM circles.
+    __shared__ uint prefixInput[SCAN_BLOCK_DIM];        // hit flags
+    __shared__ uint prefixOutput[SCAN_BLOCK_DIM];       // scan offsets
+    __shared__ uint prefixScratch[2 * SCAN_BLOCK_DIM];  // scan workspace
+    __shared__ uint hitList[SCAN_BLOCK_DIM];            // compacted circle indices
+
+    int numCircles = cuConstRendererParams.numCircles;
+
+    // Every thread runs the same number of batches (numCircles is uniform), so
+    // all threads reach every __syncthreads together -- no divergence at a sync.
+    for (int batch = 0; batch < numCircles; batch += SCAN_BLOCK_DIM) {
+        int circleIdx = batch + linearIdx;
+
+        // 1) Cull: does my circle intersect this tile's box?
+        uint hit = 0;
+        if (circleIdx < numCircles) {
+            float3 p   = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
+            float  rad = cuConstRendererParams.radius[circleIdx];
+            hit = circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+        }
+        prefixInput[linearIdx] = hit;   // every slot written (0 if out of range)
+        __syncthreads();                // (1) all flags visible before the scan
+
+        // 2) Exclusive scan of the flags -> this thread's slot in the hit list.
+        sharedMemExclusiveScan(linearIdx, prefixInput, prefixOutput, prefixScratch, SCAN_BLOCK_DIM);
+        __syncthreads();                // (2) the scan has no trailing sync; make outputs visible
+
+        // 3) Scatter each hit into the compact list; derive the batch hit count.
+        if (hit)
+            hitList[prefixOutput[linearIdx]] = circleIdx;
+        int hitCount = prefixOutput[SCAN_BLOCK_DIM - 1] + prefixInput[SCAN_BLOCK_DIM - 1];
+        __syncthreads();                // (3) all scatters visible before shading
+
+        // 4) Shade: blend this batch's hits, in index order, into the register.
+        if (validPixel) {
+            for (int k = 0; k < hitCount; k++) {
+                int c = hitList[k];
+                float3 p = *(float3*)(&cuConstRendererParams.position[3 * c]);
+                shadePixel(c, pixelCenter, p, color);
+            }
+        }
+        __syncthreads();                // (4) shading done before the next batch reuses shared mem
+    }
+
+    if (validPixel)
+        *imgPtr = color;   // single write per pixel
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -620,12 +678,12 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    // one thread per pixel; 16x16 = 256 threads per block
-    dim3 blockDim(16, 16, 1);
+    // one thread block per TILE_DIM x TILE_DIM tile, one thread per pixel
+    dim3 blockDim(TILE_DIM, TILE_DIM, 1);
     dim3 gridDim(
-        (image->width + blockDim.x - 1) / blockDim.x,
-        (image->height + blockDim.y - 1) / blockDim.y);
+        (image->width  + TILE_DIM - 1) / TILE_DIM,
+        (image->height + TILE_DIM - 1) / TILE_DIM);
 
-    kernelRenderPixels<<<gridDim, blockDim>>>();
+    kernelRenderTiles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
