@@ -488,13 +488,3 @@ The key methodological point is that none of this was guessed: the optimization
 target (reduce iterations, then reduce batch overhead) was read off Nsight
 Compute counters, and the tile size was chosen by an empirical sweep, not a hunch.
 
----
-
-## Submission Checklist
-
-- [ ] `writeup.pdf` generated from this writeup.
-- [ ] Score tables copied into the writeup.
-- [ ] Machine used for all measurements specified.
-- [ ] Partner name and SUNet ID included, if working with a partner.
-- [ ] `sh create_submission.sh` run from the assignment repository.
-- [ ] Generated zip submitted to Gradescope.
