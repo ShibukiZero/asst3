@@ -10,8 +10,8 @@ Assignment 1)?
 
 All numbers below were measured on the same AWS `g5g.xlarge` instance, which
 pairs an NVIDIA T4G GPU (40 SMs, ~15 GB, compute capability 7.5) with a 4-core
-AWS Graviton2 (Neoverse-N1) CPU. To keep the comparison on a single machine, I
-re-measured the Assignment 1 serial CPU saxpy here (single core, `N` = 20M,
+AWS Graviton2 (Neoverse-N1) CPU. To keep the comparison on a single machine, the
+Assignment 1 serial CPU saxpy was re-measured here (single core, `N` = 20M,
 3 warmup iterations + min of 10 runs) rather than reusing the original laptop
 result. All bandwidths use the 3N convention (read `X`, read `Y`, write
 `result` = 3 floats per element) so the CPU and GPU figures are directly
@@ -317,7 +317,7 @@ synchronization or main memory bandwidth requirements?
   profiling the 16x16 version showed it was partly stalled (no pipe saturated) on
   exactly this overhead.
 
-I deliberately did **not** cache circle position/radius/color in shared memory
+Circle position/radius/color was deliberately **not** cached in shared memory
 for the shade phase. It was an option (it would relieve L1, which is co-saturated),
 but it costs shared memory and occupancy, and the profiling showed culling alone
 already reached and exceeded the reference, so the extra trade was unnecessary.
@@ -334,29 +334,29 @@ measurements you performed to guide optimization.
 
 The solution was reached in three measured steps:
 
-1. **Correct, naive pixel-parallel baseline.** First I flipped the axis from
+1. **Correct, naive pixel-parallel baseline.** First the axis was flipped from
    circles to pixels: one thread per pixel, each looping over all circles in
    order and accumulating in a register. This is trivially correct (Q6) and
    scored 26/72 — full marks on tiny scenes (rgb) but failing the performance
    bar on circle-heavy scenes because its work is O(pixels x circles).
 
-2. **Profile to find the real bottleneck.** Using Nsight Systems I confirmed the
-   render kernel dominated runtime; using Nsight Compute (SpeedOfLight) on all
-   eight scenes I found the bottleneck was compute + L1, *not* DRAM (DRAM
-   throughput was ~0.02-0.13%). This corrected my initial assumption that it
+2. **Profile to find the real bottleneck.** Nsight Systems confirmed the
+   render kernel dominated runtime; Nsight Compute (SpeedOfLight) on all
+   eight scenes showed the bottleneck was compute + L1, *not* DRAM (DRAM
+   throughput was ~0.02-0.13%). This corrected the initial assumption that it
    would be memory-bound from re-reading circle data: the circle arrays stay in
    cache (all warps march through the array together), so the cost is the number
    of iterations, not memory bandwidth. The fix therefore had to *reduce
    iterations*, which is exactly what tiling + culling does — not caching.
 
-3. **Tiled culling, then a tile-size sweep.** I added the per-tile cull / scan /
-   scatter / shade kernel, which reached 72/72. Re-profiling the 16x16 version
+3. **Tiled culling, then a tile-size sweep.** The per-tile cull / scan /
+   scatter / shade kernel was added, which reached 72/72. Re-profiling the 16x16 version
    showed it was no longer saturating any pipe on sparse scenes (compute ~67-71%,
    L1 ~74-76%), with the stalls pointing at per-batch overhead (the scan + 4
    barriers, run `N/256` times; micro2M has ~7800 batches). Hypothesis: a larger
    tile means a larger batch, fewer batches, and less fixed overhead. A sweep
    over 8/16/32 confirmed it monotonically — 8x8 was much slower (4-5/9 on many
-   scenes), 32x32 much faster — so I set the tile to 32x32 (the largest legal
+   scenes), 32x32 much faster — so the tile was set to 32x32 (the largest legal
    size, since the scan caps at 1024 threads). This gave ~3x speedups on the
    circle-heavy scenes (micro2M 502 -> 145 ms) and put the renderer well past the
    reference.
@@ -426,26 +426,26 @@ Times are `Student GPU time` vs `Thrust GPU time`, 40M random ints:
 
 **What profiling showed, and what each fix did.** Nsight Systems confirmed Thrust
 runs a single main `cub::DeviceScanKernel` using a `ScanTileState` -- i.e. the
-decoupled look-back single-pass scan -- versus my 5 kernels per scan. Nsight
+decoupled look-back single-pass scan -- versus the 5 kernels per scan here. Nsight
 Compute then decomposed the (then 3.3x) time gap of the block-scan version into
 two independent factors that multiply almost exactly to the observed ratio:
 
-- **Traffic 2.16x.** I moved 771 MB of DRAM vs Thrust's 357 MB (~1.1x the 2N
-  minimum). Thrust is genuinely single-pass; I was multi-pass.
+- **Traffic 2.16x.** This implementation moved 771 MB of DRAM vs Thrust's 357 MB (~1.1x the 2N
+  minimum). Thrust is genuinely single-pass; this implementation was multi-pass.
 - **Achieved bandwidth 1.54x.** Thrust sustained 203 GB/s (63% of the T4G's
-  ~320 GB/s peak) vs my 132 GB/s (41%). The peak is fixed; the *achieved*
-  fraction is not -- my kernel stalls global memory during the in-shared-memory
+  ~320 GB/s peak) vs 132 GB/s (41%) here. The peak is fixed; the *achieved*
+  fraction is not -- this kernel stalls global memory during the in-shared-memory
   tree phase and runs only 2 elements/thread, so it keeps the bus less busy.
 
 Two of those findings became fixes (the third iteration above): (1) the original
 code did a device-to-device `cudaMemcpy` of the whole array before scanning --
-2N of pure waste inside the timed region -- which I removed by reading the input
+2N of pure waste inside the timed region -- which was removed by reading the input
 and writing the result directly; (2) adding `CONFLICT_FREE_OFFSET` padding to the
 Blelloch shared-memory indices removed bank conflicts and lifted achieved
 bandwidth. Together these roughly halved the time (5.84 -> 3.07 ms) and closed the
 gap to 1.7x, still at full marks on the checker.
 
-**Why I stopped at 1.7x.** Closing the rest means matching Thrust's traffic (2N),
+**Why the tuning stopped at 1.7x.** Closing the rest means matching Thrust's traffic (2N),
 which requires the decoupled look-back single-pass algorithm: a global per-tile
 state array, cross-block publish/look-back with memory fences and atomic status
 flags, and careful forward-progress guarantees to avoid deadlock. That is the
